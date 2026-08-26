@@ -5,6 +5,9 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 import app.api.chat as chat_api
 from app.core.agent_loop import AgentLoop
+from app.core.harness_v2_engine import _append_unconfigured_assignee_notice
+from app.core.human_handoff_service import HumanHandoffService
+from app.core.task_request_compiler import TaskExecutionResult
 from app.db.models import (
     AgentEvent,
     AgentProfile,
@@ -261,6 +264,142 @@ def test_handoff_assignee_uses_requester_when_no_owner_or_admin_exists():
         loop.db = db
 
         assert loop._human_handoff_assignee_user_id("tenant_demo", "agent_no_admin", user.id) == user.id
+
+
+def test_unconfigured_assignee_notice_skips_step_with_configured_assignee():
+    handoff = HumanHandoffRequest(
+        tenant_id="tenant_demo",
+        session_id="session_handoff",
+        assignee_user_id="user_admin",
+        metadata_json={"step": {"node_id": "n1", "assignee_user_id": "user_admin"}},
+    )
+    assignee = User(
+        id="user_admin", tenant_id="tenant_demo", username="admin", password_hash="x"
+    )
+
+    assert HumanHandoffService.unconfigured_assignee_notice(handoff, assignee) is None
+
+
+def test_unconfigured_assignee_notice_names_fallback_assignee():
+    handoff = HumanHandoffRequest(
+        tenant_id="tenant_demo",
+        session_id="session_handoff",
+        assignee_user_id="user_admin",
+        metadata_json={"step": {"node_id": "n1", "type": "handoff"}},
+    )
+    assignee = User(
+        id="user_admin",
+        tenant_id="tenant_demo",
+        username="admin",
+        display_name="管理员",
+        password_hash="x",
+    )
+
+    assert (
+        HumanHandoffService.unconfigured_assignee_notice(handoff, assignee)
+        == "由于没有配置处理人，已经转接给管理员。"
+    )
+
+
+def test_unconfigured_assignee_notice_falls_back_to_username_then_queue():
+    handoff = HumanHandoffRequest(
+        tenant_id="tenant_demo",
+        session_id="session_handoff",
+        metadata_json={"step": {}},
+    )
+    assignee = User(
+        id="user_admin", tenant_id="tenant_demo", username="admin", password_hash="x"
+    )
+
+    assert (
+        HumanHandoffService.unconfigured_assignee_notice(handoff, assignee)
+        == "由于没有配置处理人，已经转接给admin。"
+    )
+    assert (
+        HumanHandoffService.unconfigured_assignee_notice(handoff, None)
+        == "由于没有配置处理人，已转入人工处理队列。"
+    )
+
+
+def test_unconfigured_assignee_notice_tolerates_missing_metadata():
+    handoff = HumanHandoffRequest(
+        tenant_id="tenant_demo",
+        session_id="session_handoff",
+        metadata_json=None,
+    )
+
+    assert (
+        HumanHandoffService.unconfigured_assignee_notice(handoff, None)
+        == "由于没有配置处理人，已转入人工处理队列。"
+    )
+
+
+def test_append_unconfigured_assignee_notice_appends_to_reply_fragment():
+    handoff = HumanHandoffRequest(
+        id="handoff_notice",
+        tenant_id="tenant_demo",
+        session_id="session_handoff",
+        assignee_user_id="user_admin",
+        metadata_json={"step": {"node_id": "n1", "type": "handoff"}},
+    )
+    db = FakeDb(
+        get_rows={
+            (User, "user_admin"): User(
+                id="user_admin",
+                tenant_id="tenant_demo",
+                username="admin",
+                display_name="管理员",
+                password_hash="x",
+            )
+        }
+    )
+    result = TaskExecutionResult(
+        task_frame_id="frame_1",
+        status="handoff",
+        reply_fragment="好的，正在为您转接人工。",
+    )
+
+    _append_unconfigured_assignee_notice(db, result, handoff)
+
+    assert result.reply_fragment == (
+        "好的，正在为您转接人工。\n由于没有配置处理人，已经转接给管理员。"
+    )
+
+
+def test_append_unconfigured_assignee_notice_skips_configured_step_and_empty_handoff():
+    db = FakeDb()
+    configured = HumanHandoffRequest(
+        id="handoff_configured",
+        tenant_id="tenant_demo",
+        session_id="session_handoff",
+        assignee_user_id="user_admin",
+        metadata_json={"step": {"assignee_user_id": "user_admin"}},
+    )
+    result = TaskExecutionResult(
+        task_frame_id="frame_1",
+        status="handoff",
+        reply_fragment="已为您转接。",
+    )
+
+    _append_unconfigured_assignee_notice(db, result, configured)
+    assert result.reply_fragment == "已为您转接。"
+
+    _append_unconfigured_assignee_notice(db, result, None)
+    assert result.reply_fragment == "已为您转接。"
+
+
+def test_append_unconfigured_assignee_notice_fills_empty_reply():
+    handoff = HumanHandoffRequest(
+        id="handoff_notice",
+        tenant_id="tenant_demo",
+        session_id="session_handoff",
+        metadata_json={"step": {}},
+    )
+    result = TaskExecutionResult(task_frame_id="frame_1", status="handoff")
+
+    _append_unconfigured_assignee_notice(FakeDb(), result, handoff)
+
+    assert result.reply_fragment == "由于没有配置处理人，已转入人工处理队列。"
 
 
 def test_handoff_finalize_creates_pending_request_for_declared_step():

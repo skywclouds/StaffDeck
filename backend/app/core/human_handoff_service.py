@@ -131,6 +131,28 @@ class HumanHandoffService:
         user = self.db.get(User, user_id)
         return bool(user and user.tenant_id == tenant_id and user.source == "web")
 
+    @staticmethod
+    def unconfigured_assignee_notice(
+        handoff: HumanHandoffRequest,
+        assignee: User | None,
+    ) -> str | None:
+        """转人工节点未配置处理人时的用户可见提示。
+
+        节点已通过 assignee_user_id 指定处理人时返回 None(按配置转接,无需
+        说明);未配置时告知用户实际转接对象(回退链命中的处理人),完全无人
+        可转时说明已进入人工处理队列。
+        """
+        metadata = handoff.metadata_json if isinstance(handoff.metadata_json, dict) else {}
+        step = metadata.get("step")
+        if isinstance(step, dict) and str(step.get("assignee_user_id") or "").strip():
+            return None
+        name = ""
+        if assignee is not None:
+            name = str(assignee.display_name or assignee.username or "").strip()
+        if name:
+            return f"由于没有配置处理人，已经转接给{name}。"
+        return "由于没有配置处理人，已转入人工处理队列。"
+
     def assignee_user_id(
         self,
         tenant_id: str,
