@@ -1437,11 +1437,21 @@ def process_inbound(
                 interaction_mode=interaction_mode,
             )
             _send_wechat_typing(binding, inbound.from_user_id, inbound.context_token, 1, db_engine=use_engine)
+            from app.channels.dingtalk_trace import DingTalkTraceStreamer, is_dingtalk_trace_enabled
             from app.channels.feishu_trace import FeishuTraceStreamer, is_feishu_trace_enabled
+            from app.channels.trace_streamer import TraceStreamer
 
-            trace_streamer: FeishuTraceStreamer | None = None
+            trace_streamer: TraceStreamer | None = None
             if is_feishu_trace_enabled(binding):
                 trace_streamer = FeishuTraceStreamer(
+                    binding,
+                    target,
+                    inbound.event_id,
+                    db=db,
+                )
+                trace_streamer.start()
+            elif is_dingtalk_trace_enabled(binding):
+                trace_streamer = DingTalkTraceStreamer(
                     binding,
                     target,
                     inbound.event_id,

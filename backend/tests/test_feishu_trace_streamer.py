@@ -6,8 +6,9 @@ from types import SimpleNamespace
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from app.channels.adapters.feishu import FeishuPermanentError
-from app.channels.feishu_trace import FeishuTraceStreamer, _SinkEvent, is_feishu_trace_enabled
+from app.channels.adapters.feishu import FeishuPermanentError, FeishuTransientError
+from app.channels.feishu_trace import FeishuTraceStreamer, is_feishu_trace_enabled
+from app.channels.trace_streamer import _SinkEvent
 from app.db.models import Skill, Tenant, Tool
 
 
@@ -48,6 +49,7 @@ def _make_streamer(
     adapter: FakeAdapter | None = None,
     min_update_interval: float = 0.0,
     compact_sop: bool = False,
+    card_retry_delay: float = 0.0,
 ) -> FeishuTraceStreamer:
     return FeishuTraceStreamer(
         _binding(),
@@ -56,6 +58,7 @@ def _make_streamer(
         adapter=adapter or FakeAdapter(),
         min_update_interval=min_update_interval,
         compact_sop=compact_sop,
+        card_retry_delay=card_retry_delay,
     )
 
 
@@ -176,6 +179,32 @@ def test_update_failure_does_not_raise() -> None:
     streamer.on_event("router_decision_created", {"turn_id": "t1"})
     streamer.finish()
     _wait_for_worker_done(streamer)
+
+
+def test_final_patch_retries_transient_failure() -> None:
+    """回归：最终定格瞬时失败时按 retryable 重试，避免卡片永远停在"正在思考…"。"""
+
+    class _FlakyFinalAdapter(FakeAdapter):
+        def __init__(self, failures: int) -> None:
+            super().__init__()
+            self.failures = failures
+
+        def update_card(self, binding, message_id, card_json) -> None:
+            template = str(((card_json or {}).get("header") or {}).get("template") or "")
+            if template in ("green", "red") and self.failures > 0:
+                self.failures -= 1
+                raise FeishuTransientError("transient")
+            super().update_card(binding, message_id, card_json)
+
+    adapter = _FlakyFinalAdapter(failures=2)
+    streamer = _make_streamer(adapter=adapter)
+    streamer.start()
+    _wait_for_card(streamer)
+    streamer.on_event("tool_call_started", {"turn_id": "t1", "name": "lookup"})
+    streamer.finish()
+    _wait_for_worker_done(streamer)
+    last_card = adapter.update_calls[-1]["card"]
+    assert last_card["header"]["template"] == "green"
 
 
 def test_finish_marks_running_lines_completed() -> None:
