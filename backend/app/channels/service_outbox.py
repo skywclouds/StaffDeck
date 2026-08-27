@@ -783,6 +783,13 @@ def _run_delivery_lane(
 
 
 def start_delivery_daemon(*, db_engine=None) -> None:
+    """启动渠道投递守护线程（幂等,已存活则跳过）。
+
+    分别拉起两条独立轮询 lane:
+    - 普通投递(reply/handoff_notice/admin_alert 等非 reaction 类型);
+    - reaction 投递(reaction_add/reaction_remove),便于独立重试与卡死恢复。
+    共享 _delivery_stop 事件,由 stop_delivery_daemon 统一唤醒退出。
+    """
     global _delivery_thread, _reaction_delivery_thread
     _delivery_stop.clear()
     if not (_delivery_thread and _delivery_thread.is_alive()):
@@ -1086,6 +1093,10 @@ def notify_handoff_assignee(
     context_summary: str,
 ) -> None:
     """转人工时给 assignee 发渠道私聊通知(kind=handoff_notice)。
+
+    本函数只负责落库:向 outbox 写入一条 status="pending" 的 ChannelDelivery
+    记录并 commit,不实际调用渠道 API。真正投递由 start_delivery_daemon 启动
+    的守护线程异步轮询完成。
 
     通用链路:assignee_user_id → 当前 binding scope 下的非群聊 ChannelIdentity
     → 外部用户 id(open_id/chat_id)。按 binding.channel 构造各渠道投递 target,
