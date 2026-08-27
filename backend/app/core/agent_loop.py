@@ -733,6 +733,9 @@ class AgentLoop:
     ) -> HumanHandoffRequest:
         # SOP 节点指定的处理人:从当前 step 的 assignee_user_id 字段读取
         # (handoff 类型节点或 allowed_actions 含 handoff_human 的节点可配置)。
+        # 现行方案(human_handoff_service.HANDOFF_STEP_ASSIGNEE_ENABLED=False)下,
+        # 该值在 HumanHandoffService.create 中被忽略,转人工优先走渠道默认处理人;
+        # 回滚开关打开后此处的节点处理人重新生效。
         # assignee_notify_channel 指定投递渠道:None=默认;"web"=仅网页端;绑定渠道=按渠道转接。
         step_assignee_user_id: str | None = None
         step_notify_channel: str | None = None

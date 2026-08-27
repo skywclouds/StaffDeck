@@ -163,12 +163,21 @@ def _inbound_event(
 
 
 # ---------------------------------------------------------------------------
-# assignee 优先级链:SOP 节点 → 渠道默认 → owner → admin
+# assignee 优先级链:现行(渠道默认 → owner → admin);回滚开关打开时
+# 恢复 SOP 节点 → 渠道默认 → owner → admin
 # ---------------------------------------------------------------------------
 
 
-def test_assignee_prefers_step_assignee_user_id() -> None:
-    """SOP 节点指定 assignee_user_id 时,优先用它,忽略渠道默认/owner/admin。"""
+def _enable_step_assignee(monkeypatch) -> None:
+    """打开回滚开关,恢复 SOP 节点处理人优先(现行方案默认关闭)。"""
+    import app.core.human_handoff_service as handoff_service_module
+
+    monkeypatch.setattr(handoff_service_module, "HANDOFF_STEP_ASSIGNEE_ENABLED", True)
+
+
+def test_assignee_prefers_step_assignee_user_id(monkeypatch) -> None:
+    """回滚开关打开时,SOP 节点指定 assignee_user_id 优先,忽略渠道默认/owner/admin。"""
+    _enable_step_assignee(monkeypatch)
     from app.core.human_handoff_service import HumanHandoffService
     from app.session.session_schema import StepAgentResult
 
@@ -198,6 +207,44 @@ def test_assignee_prefers_step_assignee_user_id() -> None:
             binding_default_assignee_user_id="admin_user",
         )
         assert handoff.assignee_user_id == "assignee_user"
+        assert handoff.metadata_json["assignee_source"] == "step"
+
+
+def test_assignee_ignores_step_assignee_when_selector_disabled() -> None:
+    """现行方案:SOP 节点上的 assignee_user_id 被忽略,渠道默认处理人优先。"""
+    from app.core.human_handoff_service import HumanHandoffService
+    from app.session.session_schema import StepAgentResult
+
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_tenant(db)
+        db.add(AgentProfile(id="agent_demo", tenant_id="tenant_demo", name="IT"))
+        session = ChatSession(
+            id="session_sop_disabled",
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+            status="active",
+        )
+        db.add(session)
+        db.commit()
+
+        service = HumanHandoffService(db, FakeEvents())
+        handoff = service.create(
+            "tenant_demo",
+            session,
+            StepAgentResult(),
+            current_step_resolver=lambda: {"name": "转人工", "assignee_user_id": "assignee_user"},
+            assignee_resolver=lambda *_: "admin_user",
+            context_summary=lambda _: "",
+            pending_question=lambda *_: "问题",
+            step_assignee_user_id="assignee_user",
+            step_notify_channel="web",
+            binding_default_assignee_user_id="admin_user",
+            binding_default_notify_channel="feishu",
+        )
+        assert handoff.assignee_user_id == "admin_user"
+        assert handoff.metadata_json["assignee_source"] == "binding_default"
+        assert handoff.metadata_json["assignee_notify_channel"] == "feishu"
 
 
 def test_assignee_falls_back_to_binding_default() -> None:
@@ -231,6 +278,7 @@ def test_assignee_falls_back_to_binding_default() -> None:
             binding_default_assignee_user_id="assignee_user",
         )
         assert handoff.assignee_user_id == "assignee_user"
+        assert handoff.metadata_json["assignee_source"] == "binding_default"
 
 
 def test_assignee_skips_invalid_configured_users() -> None:
@@ -321,8 +369,9 @@ def test_assignee_falls_back_to_owner_then_admin() -> None:
         assert handoff.assignee_user_id == "admin_user"
 
 
-def test_assignee_notify_channel_follows_selected_assignee() -> None:
-    """投递渠道随命中的处理人配置走,并写入 handoff metadata 供通知网关判断。"""
+def test_assignee_notify_channel_follows_selected_assignee(monkeypatch) -> None:
+    """回滚开关打开时,投递渠道随命中的处理人配置走,并写入 handoff metadata 供通知网关判断。"""
+    _enable_step_assignee(monkeypatch)
     from app.core.human_handoff_service import HumanHandoffService
     from app.session.session_schema import StepAgentResult
 
