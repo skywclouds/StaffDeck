@@ -589,7 +589,7 @@ def test_notify_handoff_assignee_stages_handoff_notice_delivery() -> None:
         db.add(_pending_handoff())
         db.commit()
 
-        notify_handoff_assignee(db, binding, _pending_handoff(), "网络故障", "user: 网络断了")
+        notify_handoff_assignee(db, binding, _pending_handoff())
         deliveries = db.exec(
             select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_notice")
         ).all()
@@ -598,8 +598,8 @@ def test_notify_handoff_assignee_stages_handoff_notice_delivery() -> None:
         assert delivery.target_json["receive_id_type"] == "open_id"
         assert delivery.target_json["receive_id"] == "ou_assignee"
         assert delivery.target_json["handoff_id"] == "handoff_demo"
-        assert "指派人" in delivery.text  # User.display_name
-        assert "网络故障" in delivery.text
+        assert "【转人工】" in delivery.text
+        assert "网络故障" in delivery.text  # 无会话消息时回退 pending_question
         # 通知优先引导直接引用回复,不再强制 /回复反馈 前缀
         assert "直接回复本条消息" in delivery.text
         assert "/回复反馈" in delivery.text  # 前缀指令仍作为备选保留
@@ -619,8 +619,8 @@ def test_notify_handoff_assignee_deduplicates_existing_notice() -> None:
         db.add(handoff)
         db.commit()
 
-        notify_handoff_assignee(db, binding, handoff, "网络故障", "")
-        notify_handoff_assignee(db, binding, handoff, "网络故障", "")
+        notify_handoff_assignee(db, binding, handoff)
+        notify_handoff_assignee(db, binding, handoff)
 
         deliveries = db.exec(
             select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_notice")
@@ -640,11 +640,301 @@ def test_notify_handoff_assignee_skips_when_no_open_id() -> None:
         db.commit()
 
         # 无 ChannelIdentity → 跳过,不登记 delivery
-        notify_handoff_assignee(db, binding, _pending_handoff(), "问题", "")
+        notify_handoff_assignee(db, binding, _pending_handoff())
         deliveries = db.exec(
             select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_notice")
         ).all()
         assert deliveries == []
+
+
+# ---------------------------------------------------------------------------
+# handoff 通知正文:SOP 作用域对话窗口
+# ---------------------------------------------------------------------------
+
+
+def _seed_sop_conversation(
+    db: Session,
+    *,
+    with_entry_event: bool = True,
+    assignee_source: str = "fallback",
+) -> None:
+    """SOP 会话场景:进入 SOP 前的旧消息 + skill_started 事件 + SOP 内两轮对话。
+
+    时间线(秒):
+    0  用户:进入 SOP 前的问题(不应出现在通知里)
+    1  助手:旧回复(不应出现在通知里)
+    2  用户:触发 SOP 的咨询 ← 窗口起点
+    3  skill_started 事件(legal_consult)
+    4  助手:追问补充信息
+    5  用户:7 点结构化答复(转人工触发消息)
+    转人工回复(step_reply)由通知组装逻辑补为末条助手消息。
+    会话挂在飞书 binding 上,提问人身份由该 binding 的 scope 解析。
+    """
+    from datetime import timedelta
+
+    from app.db.models import AgentEvent, Message, Skill
+
+    base = utc_now().replace(microsecond=0)
+    db.add(
+        Skill(
+            id="skill_legal",
+            tenant_id="tenant_demo",
+            skill_id="legal_consult",
+            name="法律咨询",
+            status="published",
+            content_json={},
+        )
+    )
+    db.add(
+        ChatSession(
+            id="session_sop_window",
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+            user_id="customer_user",
+            status="handoff",
+            channel_binding_id="binding_feishu",
+            slots_json={"topic": "开源模型使用合规"},
+        )
+    )
+    db.add(
+        ChannelIdentity(
+            tenant_id="tenant_demo",
+            channel="feishu",
+            external_account_scope="",
+            external_user_id="ou_customer",
+            staffdeck_user_id="customer_user",
+            display_name="张三",
+        )
+    )
+    rows: list[object] = [
+        Message(
+            tenant_id="tenant_demo",
+            session_id="session_sop_window",
+            role="user",
+            content="之前咨询过别的问题",
+            created_at=base,
+        ),
+        Message(
+            tenant_id="tenant_demo",
+            session_id="session_sop_window",
+            role="assistant",
+            content="旧回复",
+            created_at=base + timedelta(seconds=1),
+        ),
+        Message(
+            tenant_id="tenant_demo",
+            session_id="session_sop_window",
+            role="user",
+            content="合作伙伴在PR里用了我们的开源模型，想咨询合规问题",
+            created_at=base + timedelta(seconds=2),
+        ),
+    ]
+    if with_entry_event:
+        rows.append(
+            AgentEvent(
+                tenant_id="tenant_demo",
+                session_id="session_sop_window",
+                event_type="skill_started",
+                payload_json={"to_skill_id": "legal_consult"},
+                created_at=base + timedelta(seconds=3),
+            )
+        )
+    rows.extend(
+        [
+            Message(
+                tenant_id="tenant_demo",
+                session_id="session_sop_window",
+                role="assistant",
+                content="请补充：时间期限、合作伙伴名称、金额与地区等信息。",
+                created_at=base + timedelta(seconds=4),
+            ),
+            Message(
+                tenant_id="tenant_demo",
+                session_id="session_sop_window",
+                role="user",
+                content="1.时间期限:9月初 2.合作伙伴名称:AA 3.金额与地区:无金额、大陆",
+                created_at=base + timedelta(seconds=5),
+            ),
+        ]
+    )
+    for row in rows:
+        db.add(row)
+    db.add(
+        HumanHandoffRequest(
+            id="handoff_sop_window",
+            tenant_id="tenant_demo",
+            session_id="session_sop_window",
+            agent_id="agent_demo",
+            assignee_user_id="assignee_user",
+            trigger_skill_id="legal_consult",
+            pending_question="好的，正在为您转接人工。",
+            status="pending",
+            metadata_json={
+                "step": {"name": "转交真人法务"},
+                "step_reply": "好的，正在为您转接人工。",
+                "assignee_source": assignee_source,
+            },
+        )
+    )
+    db.commit()
+
+
+def _handoff_notice_text(db: Session) -> str:
+    from app.channels.service_outbox import notify_handoff_assignee
+
+    binding = db.get(ChannelBinding, "binding_feishu")
+    handoff = db.get(HumanHandoffRequest, "handoff_sop_window")
+    assert binding is not None and handoff is not None
+    notify_handoff_assignee(db, binding, handoff)
+    delivery = db.exec(
+        select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_notice")
+    ).first()
+    assert delivery is not None
+    return delivery.text
+
+
+def test_handoff_notice_shows_sop_scoped_conversation() -> None:
+    """通知含 SOP 名称/节点/提问人,以及自触发 SOP 起到转人工的完整对话。"""
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_tenant(db)
+        db.add(_feishu_binding())
+        db.add(_channel_identity(external_user_id="ou_assignee"))
+        _seed_sop_conversation(db)
+
+        text = _handoff_notice_text(db)
+
+        assert text.startswith("【转人工】法律咨询·转交真人法务")
+        assert "提问人：张三" in text
+        # 回退链命中的处理人(fallback)时说明实际转接对象,与网页端一致
+        assert "由于没有配置处理人，已经转接给指派人。" in text
+        assert "（自进入该SOP起）" in text
+        # 窗口起点 = 触发 SOP 的用户消息,其后的追问与答复都在
+        assert "合作伙伴在PR里用了我们的开源模型" in text
+        assert "请补充：时间期限、合作伙伴名称、金额与地区等信息。" in text
+        assert "1.时间期限:9月初 2.合作伙伴名称:AA" in text
+        # 转人工回复补为末条助手消息
+        assert "助手：好的，正在为您转接人工。" in text
+        # SOP 之前的旧消息不在窗口内
+        assert "之前咨询过别的问题" not in text
+        assert "旧回复" not in text
+        # slots 不再展开(与用户原话重复且键名不可读)
+        assert "已收集信息" not in text
+        assert "topic" not in text
+        # 回复指引保留
+        assert "直接回复本条消息" in text
+        assert "/回复反馈" in text
+
+
+def test_handoff_notice_omits_unconfigured_notice_for_binding_default() -> None:
+    """命中渠道默认处理人(binding_default)视为已配置,不输出未配置说明。"""
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_tenant(db)
+        db.add(_feishu_binding())
+        db.add(_channel_identity(external_user_id="ou_assignee"))
+        _seed_sop_conversation(db, assignee_source="binding_default")
+
+        text = _handoff_notice_text(db)
+
+        assert "由于没有配置处理人" not in text
+        assert "【转人工】法律咨询·转交真人法务" in text
+
+
+def test_human_handoff_read_exposes_unified_notice() -> None:
+    """网页收件箱与渠道通知共用一份内容:pending 生成 notice,非 pending 不生成。"""
+    from app.api import chat as chat_api
+
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_tenant(db)
+        db.add(_feishu_binding())
+        db.add(_channel_identity(external_user_id="ou_assignee"))
+        _seed_sop_conversation(db)
+
+        row = db.get(HumanHandoffRequest, "handoff_sop_window")
+        assert row is not None
+        read = chat_api.human_handoff_read(db, row)
+
+        assert read.notice is not None
+        assert read.notice.title == "法律咨询·转交真人法务"
+        assert read.notice.inquirer_name == "张三"
+        assert read.notice.assignee_notice == "由于没有配置处理人，已经转接给指派人。"
+        assert read.notice.scoped is True
+        assert [item.role for item in read.notice.conversation] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert read.notice.conversation[0].text.startswith("合作伙伴在PR里")
+        assert read.notice.conversation[-1].text == "好的，正在为您转接人工。"
+
+        # 已答复的历史项不生成 notice(收件箱只展示待处理项)
+        row.status = "answered"
+        db.add(row)
+        db.commit()
+        assert chat_api.human_handoff_read(db, row).notice is None
+
+
+def test_handoff_notice_falls_back_to_full_conversation_without_entry_event() -> None:
+    """查不到 SOP 入口事件(历史数据)时回退完整会话记录,不带窗口标注。"""
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_tenant(db)
+        db.add(_feishu_binding())
+        db.add(_channel_identity(external_user_id="ou_assignee"))
+        _seed_sop_conversation(db, with_entry_event=False)
+
+        text = _handoff_notice_text(db)
+
+        assert "（自进入该SOP起）" not in text
+        assert "之前咨询过别的问题" in text
+        assert "1.时间期限:9月初" in text
+
+
+def test_handoff_notice_drops_oldest_messages_when_over_budget() -> None:
+    """超预算时从最旧消息开始丢弃并标注省略条数,最新轮次保持完整。"""
+    from datetime import timedelta
+
+    from app.db.models import Message
+
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_tenant(db)
+        db.add(_feishu_binding())
+        db.add(_channel_identity(external_user_id="ou_assignee"))
+        _seed_sop_conversation(db)
+        base = utc_now().replace(microsecond=0) + timedelta(minutes=10)
+        # SOP 内追加 10 轮长消息,挤爆 1800 字预算
+        for index in range(10):
+            db.add(
+                Message(
+                    tenant_id="tenant_demo",
+                    session_id="session_sop_window",
+                    role="user",
+                    content=f"第{index}轮补充说明：" + "长消息内容" * 90,
+                    created_at=base + timedelta(seconds=index),
+                )
+            )
+        db.add(
+            Message(
+                tenant_id="tenant_demo",
+                session_id="session_sop_window",
+                role="user",
+                content="最新一条：紧急程度为紧急",
+                created_at=base + timedelta(seconds=20),
+            )
+        )
+        db.commit()
+
+        text = _handoff_notice_text(db)
+
+        assert "（较早的" in text
+        assert "条对话已省略）" in text
+        assert "最新一条：紧急程度为紧急" in text
+        assert "第0轮补充说明" not in text
+        assert len(text) <= 2000
 
 
 def test_write_handoff_notify_message_id_persists_message_id() -> None:
@@ -797,7 +1087,7 @@ def test_notify_handoff_assignee_stages_wecom_delivery_with_chat_id() -> None:
         db.add(_pending_handoff())
         db.commit()
 
-        notify_handoff_assignee(db, binding, _pending_handoff(), "网络故障", "user: 网络断了")
+        notify_handoff_assignee(db, binding, _pending_handoff())
         deliveries = db.exec(
             select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_notice")
         ).all()
@@ -806,7 +1096,7 @@ def test_notify_handoff_assignee_stages_wecom_delivery_with_chat_id() -> None:
         assert delivery.binding_id == "binding_wecom"
         assert delivery.target_json["to_user_id"] == "staff_assignee"
         assert delivery.target_json["handoff_id"] == "handoff_demo"
-        assert "指派人" in delivery.text
+        assert "【转人工】" in delivery.text
         assert delivery.status == "pending"
 
 
@@ -830,7 +1120,7 @@ def test_notify_handoff_assignee_skips_when_identity_scope_mismatches() -> None:
         db.add(_pending_handoff())
         db.commit()
 
-        notify_handoff_assignee(db, binding, _pending_handoff(), "问题", "")
+        notify_handoff_assignee(db, binding, _pending_handoff())
         deliveries = db.exec(
             select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_notice")
         ).all()
@@ -863,7 +1153,7 @@ def test_notify_handoff_assignee_skips_unsupported_private_message_channel() -> 
         db.add(_pending_handoff())
         db.commit()
 
-        notify_handoff_assignee(db, binding, _pending_handoff(), "问题", "")
+        notify_handoff_assignee(db, binding, _pending_handoff())
         deliveries = db.exec(
             select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_notice")
         ).all()
@@ -903,7 +1193,7 @@ class _RecordingOutbox:
     def __init__(self) -> None:
         self.calls: list[ChannelBinding] = []
 
-    def __call__(self, db, binding, handoff, pending_question, context_summary) -> None:
+    def __call__(self, db, binding, handoff) -> None:
         self.calls.append(binding)
 
 

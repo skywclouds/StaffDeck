@@ -855,13 +855,7 @@ class AgentLoop:
             if session_binding.channel not in HANDOFF_NOTIFY_CHANNELS:
                 return
             binding = session_binding
-        notify_handoff_assignee(
-            self.db,
-            binding,
-            handoff,
-            handoff.pending_question or "",
-            handoff.context_summary or "",
-        )
+        notify_handoff_assignee(self.db, binding, handoff)
 
     def _apply_step_result(
         self,

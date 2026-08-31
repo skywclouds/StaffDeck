@@ -21,7 +21,6 @@ from app.db.models import (
     ChatSession,
     HumanHandoffRequest,
     Message,
-    User,
     new_id,
     utc_now,
 )
@@ -43,10 +42,6 @@ _NON_DELIVERY_CHANNELS = {
     PILOTDECK_GROUP_CHAT_CHANNEL,
     "skill_test",
 }
-# handoff 问题描述里要过滤掉的内部 slot 键。
-_INTERNAL_SLOT_KEYS = frozenset(
-    {"handoff_confirmed", "message_content", "_tool_results"}
-)
 
 
 def _stage_failed_delivery(
@@ -1009,88 +1004,10 @@ def _write_handoff_notify_message_id(
     db.add(handoff)
 
 
-def _resolve_inquirer_display_name(
-    db: Session,
-    session: ChatSession,
-    binding: ChannelBinding,
-) -> str:
-    """查找提问人显示名:优先 ChannelIdentity.display_name,回退 User.display_name。"""
-    if not session.user_id:
-        return ""
-    scope = external_account_scope(db, binding)
-    identity = db.exec(
-        select(ChannelIdentity).where(
-            ChannelIdentity.staffdeck_user_id == session.user_id,
-            ChannelIdentity.channel == binding.channel,
-            ChannelIdentity.external_account_scope == scope,
-        )
-    ).first()
-    if identity and identity.display_name:
-        return identity.display_name.strip()
-    user = db.get(User, session.user_id)
-    if user:
-        return str(user.display_name or user.username or "").strip()
-    return ""
-
-
-def _build_handoff_problem_description(
-    db: Session,
-    handoff: HumanHandoffRequest,
-    binding: ChannelBinding,
-) -> str:
-    """构造给处理人看的问题描述:提问人 + 用户原始消息 + 已收集 slots + step 名称。
-
-    找不到 session/message 时回退到 handoff.pending_question。
-    """
-    parts: list[str] = []
-    # step name
-    metadata = handoff.metadata_json or {}
-    step = metadata.get("step") if isinstance(metadata, dict) else None
-    if isinstance(step, dict):
-        step_name = str(step.get("name") or "").strip()
-        if step_name:
-            parts.append(f"[{step_name}]")
-    # 提问人 + 用户最后一条消息 + slots
-    session = db.get(ChatSession, handoff.session_id)
-    if session:
-        inquirer = _resolve_inquirer_display_name(db, session, binding)
-        if inquirer:
-            parts.append(f"提问人:{inquirer}")
-        user_msg = db.exec(
-            select(Message)
-            .where(
-                Message.session_id == handoff.session_id,
-                Message.role == "user",
-            )
-            .order_by(Message.created_at.desc())
-        ).first()
-        if user_msg and user_msg.content.strip():
-            parts.append(user_msg.content.strip()[:300])
-        slots = session.slots_json or {}
-        if isinstance(slots, dict) and slots:
-            slot_lines = [
-                f"  {k}: {v}"
-                for k, v in slots.items()
-                if v and k not in _INTERNAL_SLOT_KEYS
-            ]
-            if slot_lines:
-                parts.append("已收集信息:\n" + "\n".join(slot_lines))
-    if not parts:
-        fallback = (handoff.pending_question or "").strip()
-        if fallback:
-            return fallback[:600]
-        return "当前 SOP 需要人工确认后继续执行。"
-    # 截断保证整条通知(含上下文摘要)不超过渠道单条消息上限:超限会拆分多条,
-    # 处理人引用回复时只有末条消息 id 可关联,拆分会破坏引用回复匹配。
-    return "\n".join(parts)[:600]
-
-
 def notify_handoff_assignee(
     db: Session,
     binding: ChannelBinding,
     handoff: HumanHandoffRequest,
-    pending_question: str,
-    context_summary: str,
 ) -> None:
     """转人工时给 assignee 发渠道私聊通知(kind=handoff_notice)。
 
@@ -1103,6 +1020,13 @@ def notify_handoff_assignee(
     经 outbox worker 用对应渠道 adapter 投递。无可用身份时跳过(网页收件箱兜底)。
     任何异常仅记日志,不影响 handoff 主流程。
     """
+    # 延迟导入:app.core 包 __init__ 会拉起 agent_loop → service_outbox,
+    # 模块级导入会形成环(与 agent_loop._maybe_notify_handoff_assignee 同款处理)。
+    from app.core.handoff_notice import (
+        build_handoff_notice_content,
+        render_handoff_notice_text,
+    )
+
     try:
         if binding.channel not in HANDOFF_NOTIFY_CHANNELS:
             logger.info(
@@ -1132,24 +1056,7 @@ def notify_handoff_assignee(
                 handoff.assignee_user_id,
             )
             return
-        # assignee 显示名:从 User 表取,无则空
-        assignee = db.get(User, handoff.assignee_user_id) if handoff.assignee_user_id else None
-        name = ""
-        if assignee:
-            name = str(assignee.display_name or assignee.username or "").strip()
-        problem_description = _build_handoff_problem_description(db, handoff, binding)
-        text_parts = [
-            f"【人工介入转接】{'已转接给真人员工 ' + name if name else '有一条人工介入待处理'}",
-            "",
-            "问题:" + problem_description,
-        ]
-        if context_summary:
-            text_parts.append("")
-            text_parts.append("上下文:")
-            text_parts.append(context_summary[:800])
-        text_parts.append("")
-        text_parts.append("如需答复，请直接回复本条消息（引用后输入答复内容）；也可发送 /回复反馈 <答复内容>。")
-        text = "\n".join(text_parts)
+        text = render_handoff_notice_text(build_handoff_notice_content(db, handoff))
         build_target = _HANDOFF_NOTIFY_TARGET_BUILDERS[binding.channel]
         target = build_target(external_user_id, handoff.id)
         target["handoff_id"] = handoff.id
