@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 from datetime import UTC, datetime
@@ -30,6 +31,30 @@ _CARD_MAX_ATTEMPTS = 4
 _SOP_FLIP_FRAMES = ("📖", "📗", "📘", "📙", "📕")
 # 紧凑模式合成行 id（不在事件行中存在，渲染时动态追加）。
 _SOP_PROGRESS_LINE_ID = "__sop_compact_progress__"
+
+# 无 SOP 匹配（闲聊/普通咨询）轮次，Router 的 reason/user_intent 可能夹带
+# 内部英文枚举（如 conversation、answer_only），这些文本会原样展示在终端
+# 用户的渠道卡片上。已知内部枚举映射为中文说法，其余英文词直接删除；
+# 「SOP」与用户原文中的英文（被复述）保留。
+_NO_SOP_TRACE_TERM_LABELS = {
+    "conversation": "普通对话",
+    "answer_only": "直接回答",
+    "chitchat": "闲聊",
+    "smalltalk": "闲聊",
+    "clarify": "澄清",
+    "handoff_human": "转人工",
+    "continue_active": "继续当前流程",
+    "start_new_task": "启动新任务",
+    "switch_to_pending": "切换待办任务",
+    "create_pending": "新建待办任务",
+    "update_pending": "更新待办任务",
+    "complete_task": "结束任务",
+    "router": "路由",
+    "task_frame": "任务",
+    "task_frames": "任务",
+}
+_TRACE_ENGLISH_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_\-]*")
+_TRACE_CJK_CLASS = r"\u4e00-\u9fff，。；、：！？"
 
 
 class _SinkEvent:
@@ -136,6 +161,7 @@ class TraceStreamer:
         step_names: dict[str, dict[str, str]] | None = None,
         tool_names: dict[str, str] | None = None,
         db=None,
+        user_message: str | None = None,
         min_update_interval: float = _MIN_UPDATE_INTERVAL,
         compact_sop: bool | None = None,
         card_retry_delay: float = _CARD_RETRY_DELAY,
@@ -148,6 +174,7 @@ class TraceStreamer:
         self._step_names = dict(step_names or {})
         self._tool_names = dict(tool_names or {})
         self._db = db
+        self._user_message = str(user_message or "")
         self._min_update_interval = max(0.1, float(min_update_interval))
         self._card_retry_delay = max(0.0, float(card_retry_delay))
         self._message_id: str | None = None
@@ -367,6 +394,8 @@ class TraceStreamer:
             target_skill_id = str(payload.get("target_skill_id") or "").strip()
             if target_skill_id:
                 self._skill_hint = target_skill_id
+            if _router_decision_without_sop(payload):
+                payload = _sanitize_no_sop_router_payload(payload, self._user_message)
 
         from app.api.chat import _event_trace_lines
 
@@ -686,3 +715,50 @@ def _sop_line_hidden(event_type: str, payload: dict[str, Any], line: dict) -> bo
     if str(line.get("state") or "") == "failed":
         return False
     return event_type not in {"router_decision_created", "general_skill_intent_checked"}
+
+
+def _router_decision_without_sop(payload: dict[str, Any]) -> bool:
+    """router_decision_created 事件是否未匹配任何 SOP（闲聊/普通咨询轮次）。"""
+    if str(payload.get("target_skill_id") or "").strip():
+        return False
+    for frame in payload.get("task_frames") or []:
+        if isinstance(frame, dict) and str(frame.get("target_skill_id") or "").strip():
+            return False
+    return True
+
+
+def _sanitize_no_sop_router_payload(
+    payload: dict[str, Any], user_message: str | None
+) -> dict[str, Any]:
+    """净化无 SOP 轮次的 Router 决策展示文案，仅影响卡片渲染，不改入库数据。"""
+    sanitized = dict(payload)
+    for field in ("user_intent", "reason"):
+        value = str(sanitized.get(field) or "").strip()
+        if value:
+            sanitized[field] = _sanitize_no_sop_trace_text(value, user_message)
+    return sanitized
+
+
+def _sanitize_no_sop_trace_text(text: str, user_message: str | None) -> str:
+    """删除文案中的英文词；保留「SOP」与用户原文中出现过的英文。"""
+    if not text:
+        return ""
+    user_words = {
+        word.lower() for word in _TRACE_ENGLISH_WORD.findall(user_message or "")
+    }
+
+    def _replace(match: re.Match) -> str:
+        raw = match.group(0)
+        key = raw.lower()
+        if key == "sop" or key in user_words:
+            return raw
+        return _NO_SOP_TRACE_TERM_LABELS.get(key, "")
+
+    sanitized = _TRACE_ENGLISH_WORD.sub(_replace, text)
+    sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
+    sanitized = re.sub(rf"(?<=[{_TRACE_CJK_CLASS}]) +", "", sanitized)
+    sanitized = re.sub(rf" +(?=[{_TRACE_CJK_CLASS}])", "", sanitized)
+    sanitized = re.sub(rf"([{_TRACE_CJK_CLASS}])\1+", r"\1", sanitized)
+    # 删除词首/词尾英文后可能残留悬挂标点：保留句尾句号，其余剥离。
+    sanitized = sanitized.strip().lstrip("。，、；：！？").rstrip("，、；：！？")
+    return sanitized

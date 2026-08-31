@@ -1578,6 +1578,7 @@ def process_inbound(
                     target,
                     inbound.event_id,
                     db=db,
+                    user_message=user_message,
                 )
                 trace_streamer.start()
             elif is_dingtalk_trace_enabled(binding):
@@ -1586,6 +1587,7 @@ def process_inbound(
                     target,
                     inbound.event_id,
                     db=db,
+                    user_message=user_message,
                 )
                 trace_streamer.start()
             try:

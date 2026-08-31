@@ -98,6 +98,7 @@ def _make_streamer(
     tool_names: dict | None = None,
     binding=None,
     card_retry_delay: float = 0.0,
+    user_message: str | None = None,
 ) -> DingTalkTraceStreamer:
     return DingTalkTraceStreamer(
         binding or _binding(),
@@ -110,6 +111,7 @@ def _make_streamer(
         min_update_interval=min_update_interval,
         compact_sop=compact_sop,
         card_retry_delay=card_retry_delay,
+        user_message=user_message,
     )
 
 
@@ -196,6 +198,31 @@ def test_create_card_retries_transient_network_failure() -> None:
     assert streamer._message_id is not None
     # 重试成功后正常走完流式与定格
     assert adapter.update_calls[-1]["card"]["flowStatus"] == "3"
+
+
+def test_no_sop_router_line_replaces_internal_english_terms() -> None:
+    """回归：无 SOP 匹配的闲聊轮次，卡片不得出现 conversation 等内部英文枚举。"""
+    adapter = FakeAdapter()
+    streamer = _make_streamer(adapter=adapter, user_message="你好")
+    streamer.start()
+    _wait_for_card(streamer)
+
+    streamer.on_event(
+        "router_decision_created",
+        {
+            "turn_id": "t1",
+            "decision": "answer_only",
+            "user_intent": "闲聊",
+            "reason": "用户输入你好，输入闲聊，无SOP匹配，使用conversation。",
+        },
+    )
+    streamer.finish()
+    _wait_for_worker_done(streamer)
+
+    markdown = _card_markdown(adapter)
+    assert "conversation" not in markdown
+    assert "判断意图 闲聊" in markdown
+    assert "无SOP匹配，使用普通对话" in markdown
 
 
 def test_final_state_update_retries_transient_failure() -> None:
