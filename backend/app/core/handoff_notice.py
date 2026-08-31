@@ -33,10 +33,19 @@ from app.db.models import (
 HANDOFF_NOTICE_TOTAL_LIMIT = 1800
 HANDOFF_NOTICE_MESSAGE_LIMIT = 400
 HANDOFF_NOTICE_SEPARATOR = "────────────────"
-HANDOFF_NOTICE_FOOTER = (
+# 飞书支持引用回复,通知尾部给引用回复指引;其他渠道(企微/微信客服等)没有
+# 可靠的引用消息 ID,尾部改为提示处理人带 handoff ID 显式回复。
+HANDOFF_NOTICE_QUOTE_REPLY_FOOTER = (
     "如需答复，请直接回复本条消息（引用后输入答复内容）；也可发送 /回复反馈 <答复内容>。"
 )
 HANDOFF_NOTICE_ROLE_LABELS = {"user": "用户", "assistant": "助手"}
+
+
+def _handoff_notice_footer(channel: str | None, handoff_id: str) -> str:
+    """渠道对应的回复指引:feishu 引用回复,其余渠道带 handoff ID 精确回复。"""
+    if channel == "feishu" or not channel:
+        return HANDOFF_NOTICE_QUOTE_REPLY_FOOTER
+    return f"请发送 /回复反馈 {handoff_id} <答复内容> 精确回复此请求。"
 
 
 @dataclass
@@ -235,12 +244,19 @@ def build_handoff_notice_content(
     )
 
 
-def render_handoff_notice_text(content: HandoffNoticeContent) -> str:
+def render_handoff_notice_text(
+    content: HandoffNoticeContent,
+    *,
+    channel: str | None = None,
+    handoff_id: str = "",
+) -> str:
     """渲染渠道私聊通知正文:标题/提问人/未配置说明 + 对话窗口 + 回复指引。
 
     会话超预算时从最旧的消息开始丢弃并标注省略条数,保证含 slot 答复的
     最新轮次完整;找不到任何会话消息时回退 fallback_question。
+    回复指引按 channel 区分:飞书引导引用回复,其余渠道提示带 handoff_id 回复。
     """
+    footer = _handoff_notice_footer(channel, handoff_id)
     header_lines = [f"【转人工】{content.title}".rstrip()]
     if content.inquirer:
         header_lines.append(f"提问人：{content.inquirer}")
@@ -255,7 +271,7 @@ def render_handoff_notice_text(content: HandoffNoticeContent) -> str:
             f"  {HANDOFF_NOTICE_ROLE_LABELS.get(role, role)}：{clip_handoff_message(text)}"
             for role, text in content.entries
         ]
-        budget = HANDOFF_NOTICE_TOTAL_LIMIT - len(HANDOFF_NOTICE_FOOTER)
+        budget = HANDOFF_NOTICE_TOTAL_LIMIT - len(footer)
         for line in (*header_lines, HANDOFF_NOTICE_SEPARATOR):
             budget -= len(line) + 1
         kept: list[str] = []
@@ -272,6 +288,4 @@ def render_handoff_notice_text(content: HandoffNoticeContent) -> str:
         if omitted:
             body_lines.append(f"（较早的 {omitted} 条对话已省略）")
         body_lines.extend(kept)
-    return "\n".join(
-        [*header_lines, *body_lines, HANDOFF_NOTICE_SEPARATOR, HANDOFF_NOTICE_FOOTER]
-    )
+    return "\n".join([*header_lines, *body_lines, HANDOFF_NOTICE_SEPARATOR, footer])

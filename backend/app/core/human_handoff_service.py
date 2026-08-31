@@ -44,6 +44,8 @@ class HumanHandoffService:
         step_notify_channel: str | None = None,
         binding_default_notify_channel: str | None = None,
     ) -> HumanHandoffRequest:
+        current_step = current_step_resolver()
+        pending_question_text = pending_question(current_step, step_result)
         existing = self.db.exec(
             select(HumanHandoffRequest)
             .where(HumanHandoffRequest.tenant_id == tenant_id)
@@ -51,6 +53,13 @@ class HumanHandoffService:
             .where(HumanHandoffRequest.status == "pending")
         ).first()
         if existing:
+            existing.metadata_json = {
+                **dict(existing.metadata_json or {}),
+                "step": current_step or {},
+                "step_reply": step_result.reply,
+                "step_handoff": step_result.handoff,
+            }
+            existing.updated_at = utc_now()
             chat_session.status = "handoff"
             chat_session.awaiting_input_json = {
                 "type": "human_handoff",
@@ -60,8 +69,6 @@ class HumanHandoffService:
             chat_session.updated_at = utc_now()
             return existing
 
-        current_step = current_step_resolver()
-        pending_question_text = pending_question(current_step, step_result)
         # Assignee 优先级(现行,开关关闭):当前渠道默认处理人 → 数字员工负责人 → 租户管理员。
         # HANDOFF_STEP_ASSIGNEE_ENABLED=True(回滚)时恢复原顺序:
         # SOP 节点指定 → 当前渠道默认处理人 → 数字员工负责人 → 租户管理员。
@@ -113,6 +120,12 @@ class HumanHandoffService:
                 "active_step_id": chat_session.active_step_id,
                 "slots": chat_session.slots_json or {},
                 "pending_tasks": chat_session.pending_tasks_json or [],
+                # The resume turn uses an internal channel name. Preserve the
+                # original external target so a group reply still uses chatid.
+                "channel": chat_session.channel,
+                "channel_binding_id": chat_session.channel_binding_id,
+                "channel_account_key": chat_session.channel_account_key,
+                "channel_target": dict(chat_session.channel_target_json or {}),
             },
             metadata_json={
                 "step": current_step or {},
