@@ -272,6 +272,10 @@ def human_handoff_read(db: Session, row: HumanHandoffRequest) -> HumanHandoffRea
 
 def _user_message_metadata(request: ChatTurnRequest) -> dict[str, object]:
     metadata: dict[str, object] = {}
+    if request.channel:
+        # 与 ConversationProjection.user_message_metadata 保持一致：记录回合来源渠道，
+        # outbox 依据它跳过 web 控制台回合的渠道投递。
+        metadata["channel"] = request.channel
     if request.client_turn_id:
         metadata["client_turn_id"] = request.client_turn_id
     if request.interaction_mode == "scheduled_task":

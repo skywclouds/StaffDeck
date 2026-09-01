@@ -228,7 +228,12 @@ class AgentLoop:
             chat_session = engine.session
             engine.mark_interrupted(exc.code, exc.message)
             chat_session = chat_session or self._get_or_create_session(request)
-            return self._finish_with_error(chat_session, exc.code, exc.message)
+            return self._finish_with_error(
+                chat_session,
+                exc.code,
+                exc.message,
+                user_message_id=engine.user_message_id,
+            )
         except LLMError as exc:
             chat_session = engine.session
             user_message_id = engine.user_message_id
@@ -1601,7 +1606,12 @@ class AgentLoop:
         return [{"job_id": job.id, "job_name": job.name}]
 
     def _finish_with_error(
-        self, chat_session: ChatSession, code: str, message: str
+        self,
+        chat_session: ChatSession,
+        code: str,
+        message: str,
+        *,
+        user_message_id: str | None = None,
     ) -> ChatTurnResponse:
         reply = format_runtime_failure_reply(
             "系统配置错误",
@@ -1615,7 +1625,12 @@ class AgentLoop:
             "error_occurred",
             {"code": code, "message": message},
         )
-        reply = self._finalize_turn(chat_session, chat_session.tenant_id, reply)
+        reply = self._finalize_turn(
+            chat_session,
+            chat_session.tenant_id,
+            reply,
+            user_message_id=user_message_id,
+        )
         self.db.commit()
         self.db.refresh(chat_session)
         return ChatTurnResponse(

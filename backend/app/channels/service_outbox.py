@@ -42,6 +42,8 @@ _NON_DELIVERY_CHANNELS = {
     PILOTDECK_GROUP_CHAT_CHANNEL,
     "skill_test",
 }
+# web 控制台发起的回合不向外部渠道投递回复；渠道侧消息与回复仍通过会话同步在网页端可见。
+_WEB_TURN_ORIGIN = "web"
 
 
 def _stage_failed_delivery(
@@ -77,15 +79,32 @@ def _stage_failed_delivery(
     )
 
 
-def _message_client_turn_id(db: Session, message: Message) -> str:
+def _turn_user_message(db: Session, message: Message) -> Message | None:
     metadata = message.metadata_json or {}
     user_message_id = str(metadata.get("user_message_id") or "").strip()
-    user_message = db.get(Message, user_message_id) if user_message_id else None
+    if not user_message_id:
+        return None
+    return db.get(Message, user_message_id)
+
+
+def _message_client_turn_id(db: Session, message: Message) -> str:
+    metadata = message.metadata_json or {}
+    user_message = _turn_user_message(db, message)
     return str(
         ((user_message.metadata_json or {}) if user_message else {}).get("client_turn_id")
         or metadata.get("client_turn_id")
         or ""
     ).strip()
+
+
+def _turn_origin_channel(db: Session, message: Message) -> str:
+    """解析回复所属回合的来源渠道（记录在用户消息 metadata 上）。
+
+    历史数据（升级前创建的回合）没有来源标记，返回空串并维持既有投递行为。
+    """
+    user_message = _turn_user_message(db, message)
+    origin = ((user_message.metadata_json or {}) if user_message else {}).get("channel")
+    return str(origin or "").strip()
 
 
 def _reply_idempotency_key(db: Session, binding_id: str, message: Message) -> str:
@@ -151,11 +170,14 @@ def _find_active_binding_for_agent(db: Session, chat_session: ChatSession) -> Ch
 def stage_channel_delivery(db: Session, chat_session: ChatSession, message: Message) -> None:
     """把 assistant 回复登记为渠道 outbox 投递（随主事务提交，不单独 commit）。
 
-    Web 会话不受渠道 staging 影响；渠道会话必须留下 delivery 或让事务失败。
+    Web 会话不受渠道 staging 影响；web 控制台发起的回合即使落在渠道会话上也不投递
+    （渠道用户只收到渠道侧发起消息的回复）；其余渠道会话必须留下 delivery 或让事务失败。
     """
     try:
         channel = str(getattr(chat_session, "channel", None) or "").strip()
         if not channel or channel in _NON_DELIVERY_CHANNELS:
+            return
+        if _turn_origin_channel(db, message) == _WEB_TURN_ORIGIN:
             return
         # 已锚定会话绝不跨 binding 回退，避免携带旧 target/context_token 串 Bot。
         binding = None
