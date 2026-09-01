@@ -83,13 +83,24 @@ def _feishu_binding(
     )
 
 
+def _feishu_binding_scope(app_id: str = "cli_app") -> str:
+    """默认飞书 binding 的生效 scope(app_id + provider_tenant_key 推导)。"""
+    from app.channels.service_feishu_inbox import feishu_identity_scope
+
+    return feishu_identity_scope(app_id, "tenant_key")
+
+
 def _channel_identity(
     *,
     staffdeck_user_id: str = "assignee_user",
     external_user_id: str = "ou_assignee",
-    scope: str = "",
+    scope: str | None = None,
     channel: str = "feishu",
 ) -> ChannelIdentity:
+    # 默认与 _feishu_binding 的生效 scope 对齐:入站事件回填 binding scope 后才会
+    # 按该 scope 落身份,生产数据里飞书身份不会挂在空 scope 下。
+    if scope is None:
+        scope = _feishu_binding_scope() if channel == "feishu" else ""
     return ChannelIdentity(
         tenant_id="tenant_demo",
         channel=channel,
@@ -700,7 +711,7 @@ def _seed_sop_conversation(
         ChannelIdentity(
             tenant_id="tenant_demo",
             channel="feishu",
-            external_account_scope="",
+            external_account_scope=_feishu_binding_scope(),
             external_user_id="ou_customer",
             staffdeck_user_id="customer_user",
             display_name="张三",
@@ -2358,25 +2369,21 @@ def test_run_handoff_reply_command_matches_by_identity(monkeypatch) -> None:
 
         monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
 
-        original = intake_mod.external_account_scope
-        intake_mod.external_account_scope = lambda _db, _b: ""
-        try:
-            result = _run_handoff_reply_command(db, binding, inbound, command)
-            assert resumed == [("handoff_hr1", "feishu")]
-            assert result is intake_mod._HANDOFF_REPLY_HANDLED
-            assert db.get(HumanHandoffRequest, "handoff_hr1").status == "answered"
-            ack = db.exec(
-                select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_ack")
-            ).first()
-            assert ack is not None
-            assert "已收到你的回复" in ack.text
-        finally:
-            intake_mod.external_account_scope = original
+        # 不再 mock external_account_scope:真实解析按 app_id + provider_tenant_key
+        # 推导 scope,与 _channel_identity 默认 scope 一致,走生产匹配链路。
+        result = _run_handoff_reply_command(db, binding, inbound, command)
+        assert resumed == [("handoff_hr1", "feishu")]
+        assert result is intake_mod._HANDOFF_REPLY_HANDLED
+        assert db.get(HumanHandoffRequest, "handoff_hr1").status == "answered"
+        ack = db.exec(
+            select(ChannelDelivery).where(ChannelDelivery.kind == "handoff_ack")
+        ).first()
+        assert ack is not None
+        assert "已收到你的回复" in ack.text
 
 
 def test_run_handoff_reply_command_rejects_without_identity() -> None:
     """发送者无 ChannelIdentity(未绑定 StaffDeck 身份)时拒绝,不再用 contact_target 模糊匹配。"""
-    import app.channels.service_intake as intake_mod
     from app.channels.service_intake import _run_handoff_reply_command
     from app.channels.service_routing import ChannelCommand
 
@@ -2404,18 +2411,12 @@ def test_run_handoff_reply_command_rejects_without_identity() -> None:
         inbound = _inbound(event_id="om_hr_2", from_user_id="ou_admin", text="/回复反馈 已修复")
         command = ChannelCommand(kind="handoff_reply", query="已修复")
 
-        original = intake_mod.external_account_scope
-        intake_mod.external_account_scope = lambda _db, _b: ""
-        try:
-            result = _run_handoff_reply_command(db, binding, inbound, command)
-            assert "未找到" in result or "未绑定" in result
-            assert db.get(HumanHandoffRequest, "handoff_hr2").status == "pending"
-        finally:
-            intake_mod.external_account_scope = original
+        result = _run_handoff_reply_command(db, binding, inbound, command)
+        assert "未找到" in result or "未绑定" in result
+        assert db.get(HumanHandoffRequest, "handoff_hr2").status == "pending"
 
 
 def test_run_handoff_reply_command_no_pending_handoff_returns_error() -> None:
-    import app.channels.service_intake as intake_mod
     from app.channels.service_intake import _run_handoff_reply_command
     from app.channels.service_routing import ChannelCommand
 
@@ -2430,13 +2431,8 @@ def test_run_handoff_reply_command_no_pending_handoff_returns_error() -> None:
         inbound = _inbound(event_id="om_hr_3", text="/回复反馈 已修复")
         command = ChannelCommand(kind="handoff_reply", query="已修复")
 
-        original = intake_mod.external_account_scope
-        intake_mod.external_account_scope = lambda _db, _b: ""
-        try:
-            result = _run_handoff_reply_command(db, binding, inbound, command)
-            assert "未找到" in result
-        finally:
-            intake_mod.external_account_scope = original
+        result = _run_handoff_reply_command(db, binding, inbound, command)
+        assert "未找到" in result
 
 
 def test_run_handoff_reply_command_empty_query_returns_usage() -> None:
@@ -2461,7 +2457,6 @@ def test_run_handoff_reply_command_rejects_multiple_pending(monkeypatch) -> None
     """多个 pending handoff 且未引用通知时,拒绝模糊处理。"""
     from datetime import timedelta
 
-    import app.channels.service_intake as intake_mod
     from app.channels.service_intake import _run_handoff_reply_command
     from app.channels.service_routing import ChannelCommand
 
@@ -2526,18 +2521,12 @@ def test_run_handoff_reply_command_rejects_multiple_pending(monkeypatch) -> None
 
         monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
 
-        original = intake_mod.external_account_scope
-        intake_mod.external_account_scope = lambda _db, _b: ""
-        try:
-            result = _run_handoff_reply_command(db, binding, inbound, command)
-            assert resumed == []
-            assert "多个待处理" in result
-        finally:
-            intake_mod.external_account_scope = original
+        result = _run_handoff_reply_command(db, binding, inbound, command)
+        assert resumed == []
+        assert "多个待处理" in result
 
 
 def test_run_handoff_reply_command_rejects_unknown_parent_id() -> None:
-    import app.channels.service_intake as intake_mod
     from app.channels.service_intake import _run_handoff_reply_command
     from app.channels.service_routing import ChannelCommand
 
@@ -2555,14 +2544,9 @@ def test_run_handoff_reply_command_rejects_unknown_parent_id() -> None:
         inbound.parent_id = "om_unrelated_message"
         command = ChannelCommand(kind="handoff_reply", query="修好了")
 
-        original = intake_mod.external_account_scope
-        intake_mod.external_account_scope = lambda _db, _b: ""
-        try:
-            result = _run_handoff_reply_command(db, binding, inbound, command)
-            assert "未找到" in result
-            assert db.get(HumanHandoffRequest, handoff.id).status == "pending"
-        finally:
-            intake_mod.external_account_scope = original
+        result = _run_handoff_reply_command(db, binding, inbound, command)
+        assert "未找到" in result
+        assert db.get(HumanHandoffRequest, handoff.id).status == "pending"
 
 
 def test_run_handoff_reply_command_matches_by_parent_id(monkeypatch) -> None:
@@ -2653,14 +2637,9 @@ def test_run_handoff_reply_command_matches_by_parent_id(monkeypatch) -> None:
 
         monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
 
-        original = intake_mod.external_account_scope
-        intake_mod.external_account_scope = lambda _db, _b: ""
-        try:
-            result = _run_handoff_reply_command(db, binding, inbound, command)
-            assert resumed == ["handoff_p1"]
-            assert result is intake_mod._HANDOFF_REPLY_HANDLED
-        finally:
-            intake_mod.external_account_scope = original
+        result = _run_handoff_reply_command(db, binding, inbound, command)
+        assert resumed == ["handoff_p1"]
+        assert result is intake_mod._HANDOFF_REPLY_HANDLED
 
 
 # ---------------------------------------------------------------------------
